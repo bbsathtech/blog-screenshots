@@ -1,0 +1,174 @@
+# =============================================================================
+# Android Settings screenshots — GitHub Actions
+# =============================================================================
+# WHAT THIS DOES
+#   Boots a hardware-accelerated Android emulator on a GitHub-hosted
+#   ubuntu-latest runner, opens a configurable list of Android Settings
+#   screens with `adb shell am start -a <intent>`, captures each one as a
+#   PNG with `adb exec-out screencap -p`, and uploads the PNGs as a
+#   downloadable workflow artifact.
+#
+# HOW TO USE
+#   1. Create a GitHub repo (free account, no payment needed) and put this
+#      file at  .github/workflows/android-screenshots.yml
+#   2. Actions tab -> "Android Settings screenshots" -> Run workflow.
+#      Optionally override `api-level` and/or `screens` (comma-separated
+#      name:intent pairs, see the default below).
+#   3. When the run finishes, download the artifact
+#      `android-settings-screenshots` from the run page and unzip it.
+#      The PNGs are in screenshots/.
+#   4. Or let it run on schedule (cron below: daily 06:00 UTC).
+#
+# COST (verified 2026-11-26 against docs.github.com — see report)
+#   * PUBLIC repo: standard GitHub-hosted runners are FREE and unlimited.
+#   * PRIVATE repo (GitHub Free): $12 of included compute/month.
+#     Linux 2-core = $0.006/min  =>  $12 = 2,000 Linux minutes/month.
+#     One warm run here is ~10-15 min (~$0.06-0.09). One run/day for a
+#     month is ~300-450 min (~$1.80-2.70) — well inside the free allowance.
+#   * Artifact storage: 500 MB shared with Packages on Free. Each PNG is
+#     ~200-500 KB, so a run of 10 screens is ~2-5 MB. retention-days is
+#     set to 7 on purpose: at the 90-day default, a month of daily runs
+#     would pile up past 500 MB. Download the PNGs promptly, then let
+#     the artifact expire.
+#
+# SOURCES
+#   * Emulator action README:
+#     https://github.com/ReactiveCircus/android-emulator-runner
+#     "A GitHub Action for installing, configuring and running
+#      hardware-accelerated Android Emulators on Linux and macOS virtual
+#      machines." / "It is now recommended to use the Ubuntu
+#      (ubuntu-latest) runners which are 2-3 times faster than the macOS
+#      ones" + the "Enable KVM group perms" step copied below.
+#   * Settings intents: developer.android.com "Common App Intents"
+#     (android.settings.WIFI_SETTINGS, DISPLAY_SETTINGS, SOUND_SETTINGS,
+#      SECURITY_SETTINGS, DEVICE_INFO_SETTINGS, INTERNAL_STORAGE_SETTINGS,
+#      APPLICATION_SETTINGS, BATTERY_SETTINGS, ...).
+#   * screencap + artifact pattern is used in the wild, e.g. Kiwix:
+#     "On failure, captures a screenshot via
+#      `adb exec-out screencap -p > screencap.png` and uploads it as a
+#      GitHub Actions artifact" (kiwix-android .github/workflows/ci.yml).
+# =============================================================================
+
+name: Android Settings screenshots
+
+on:
+  # Manual run from the Actions tab (with optional overrides).
+  workflow_dispatch:
+    inputs:
+      api-level:
+        description: "Android API level for the emulator (34 = Android 14)"
+        required: false
+        default: "34"
+        type: string
+      screens:
+        description: "Comma-separated name:intent pairs to capture"
+        required: false
+        default: "settings:android.settings.SETTINGS,battery:android.settings.BATTERY_SETTINGS,storage:android.settings.INTERNAL_STORAGE_SETTINGS,wifi:android.settings.WIFI_SETTINGS,apps:android.settings.APPLICATION_SETTINGS,display:android.settings.DISPLAY_SETTINGS,sound:android.settings.SOUND_SETTINGS,security:android.settings.SECURITY_SETTINGS,about:android.settings.DEVICE_INFO_SETTINGS"
+        type: string
+  # Daily run. 06:00 UTC = 08:00 EET (Cairo). Change or delete as needed.
+  schedule:
+    - cron: "0 6 * * *"
+
+# One run at a time — a second run while the emulator is booting just
+# burns minutes for nothing.
+concurrency:
+  group: android-screenshots
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      # --- KVM: required for hardware acceleration -----------------------
+      # Copied verbatim from the android-emulator-runner README
+      # ("Running hardware accelerated emulators on Linux runners").
+      # Without this the emulator falls back to slow software emulation
+      # (or fails to boot). GitHub's docs confirm hosted Linux runners
+      # support hardware acceleration for the Android SDK tools:
+      # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "::warning::/dev/kvm not present — emulator will be slow or may fail"
+
+      # --- AVD cache: makes repeat runs much faster ----------------------
+      # First run downloads the system image (~1 GB) and creates the AVD;
+      # later runs reuse it. This is the caching pattern from the README
+      # ("We can significantly reduce emulator startup time by setting up
+      # AVD snapshot caching"). Cache is 10 GB/repo, separate from the
+      # 500 MB artifact allowance.
+      - name: Cache AVD
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ inputs.api-level || '34' }}-pixel_7_pro
+
+      # --- Boot emulator + capture screens --------------------------------
+      # The action: installs SDK components (platform-tools, emulator,
+      # system image), creates the AVD, launches the emulator, waits for
+      # boot, runs `script:`, then kills the emulator. Everything in
+      # `script:` runs AFTER the emulator is booted and ready.
+      #
+      # NOTES / GOTCHAS
+      # * `emulator-options` replaces the action's defaults entirely, so
+      #   keep `-no-window -gpu swiftshader_indirect -noaudio
+      #   -no-boot-anim -camera-back none` (the README's own example).
+      #   `-gpu swiftshader_indirect` = software GL; the emulator still
+      #   uses KVM for CPU virtualization, so it stays fast.
+      # * `disable-animations: true` stops transition animations so a
+      #   screenshot taken 3 s after opening a screen is stable.
+      # * Screens are plain AOSP (Pixel) Settings. A real Samsung/Xiaomi
+      #   phone rearranges these menus — these shots are the stock-Android
+      #   reference, good enough for "where to tap" how-to articles, not
+      #   pixel-identical to every brand.
+      # * Wi-Fi / battery pages on an emulator show "no networks" / a
+      #   virtual battery. That is normal and still illustrates the UI.
+      # * If a screen's intent does not exist on this API level, `am start`
+      #   prints an error and that one PNG is skipped (the loop continues);
+      #   the step only fails if NO png was produced at all.
+      - name: Boot emulator and capture Settings screens
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          # workflow_dispatch input (empty on scheduled runs -> the .sh
+          # file's own default list is used).
+          SCREENS: ${{ inputs.screens }}
+        with:
+          api-level: ${{ inputs.api-level || '34' }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          emulator-boot-timeout: 600
+          # NOTE: this action splits `script:` into SINGLE LINES and runs
+          # each one separately with `sh -c`, so NO multi-line constructs
+          # (for-loops, if-blocks) are allowed here — all logic lives in
+          # capture-screenshots.sh; this line just calls it.
+          script: bash capture-screenshots.sh
+
+      # --- Upload ----------------------------------------------------------
+      # `if: always()` so you still get the PNGs that WERE captured even
+      # if a later screen failed. Download from the run page:
+      # Actions -> this run -> Artifacts -> android-settings-screenshots.
+      # retention-days: 7 keeps the free 500 MB artifact pool from
+      # filling up (see header). Artifacts expire and cannot be restored,
+      # so download the same day.
+      - name: Upload screenshots as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-settings-screenshots
+          path: screenshots/*.png
+          retention-days: 7
+          if-no-files-found: error
